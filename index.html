@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RAW MIDI → Scratch Converter (Pipe Separation Mode)</title>
+<style>
+  body { font-family: monospace; background:#111; color:#0f0; padding:20px; }
+  textarea { width:100%; height:320px; background:#000; color:#0f0; padding:10px; resize: none; }
+  button { margin-top:10px; padding:10px 20px; background:#222; color:#0f0; border:1px solid #0f0; cursor:pointer; font-weight: bold; }
+  button:hover { background: #0f0; color: #000; }
+  button:disabled { border-color: #333; color: #333; cursor: not-allowed; background: transparent; }
+  #progressContainer { width:100%; background:#333; height:20px; margin-top:10px; }
+  #progressBar { width:0%; height:100%; background:#0f0; transition: width 0.05s linear; }
+  .btn-group { display: flex; gap: 10px; }
+</style>
+</head>
+<body>
+
+<h2>RAW MIDI → Scratch Converter (Pipe Separation)</h2>
+<input type="file" id="midiFile" accept=".mid,.midi">
+<div class="btn-group">
+  <button id="convertBtn">Convert</button>
+  <button id="downloadBtn" disabled>Download Full Results</button>
+</div>
+
+<div id="progressContainer"><div id="progressBar"></div></div>
+
+<textarea id="output" readonly placeholder="Output preview will appear here..."></textarea>
+
+<script>
+let downloadedBlob = null;
+
+function updateProgress(p, isError = false) {
+  const bar = document.getElementById("progressBar");
+  bar.style.backgroundColor = isError ? "#f00" : "#0f0";
+  bar.style.width = p + "%";
+}
+
+// --- Worker Code ---
+const workerCode = `
+  self.onmessage = function(e) {
+    try {
+      const bytes = new Uint8Array(e.data);
+      let offset = 0;
+
+      function readString(len) {
+        let str = "";
+        for(let i=0; i<len; i++) str += String.fromCharCode(bytes[offset++]);
+        return str;
+      }
+      function read32() {
+        return (bytes[offset++] << 24) | (bytes[offset++] << 16) | (bytes[offset++] << 8) | bytes[offset++];
+      }
+      function read16() {
+        return (bytes[offset++] << 8) | bytes[offset++];
+      }
+      function read8() {
+        return bytes[offset++];
+      }
+      function readVLQ() {
+        let val = 0;
+        while(true) {
+          let b = read8();
+          val = (val << 7) | (b & 0x7f);
+          if(!(b & 0x80)) break;
+        }
+        return val;
+      }
+
+      const header = readString(4);
+      if(header !== "MThd") throw new Error("Invalid format: Not a standard MIDI file.");
+      
+      const hdLength = read32();
+      const format = read16();
+      const numTracks = read16();
+      const ppq = read16();
+      
+      offset = 8 + hdLength; 
+
+      const tempos = [{tick: 0, bpm: 120}];
+      const events = [];
+      let instrument = 1;
+
+      for(let t = 0; t < numTracks; t++) {
+        if (offset >= bytes.length) break;
+        
+        const trkHeader = readString(4);
+        const trkLen = read32();
+        
+        if(trkHeader !== "MTrk") {
+          offset += trkLen; 
+          continue;
+        }
+        
+        const endOffset = offset + trkLen;
+        let tick = 0;
+        let runningStatus = 0;
+
+        while(offset < endOffset) {
+          tick += readVLQ();
+          let status = read8();
+          
+          if(status < 0x80) {
+            status = runningStatus;
+            offset--; 
+          } else {
+            runningStatus = status;
+          }
+
+          let type = status >> 4;
+
+          if(status === 0xff) {
+            let metaType = read8();
+            let metaLen = readVLQ();
+            if(metaType === 0x51 && metaLen === 3) { 
+              let tempo = (read8() << 16) | (read8() << 8) | read8();
+              tempos.push({tick, bpm: 60000000 / tempo});
+            } else {
+              offset += metaLen; 
+            }
+          } else if(status === 0xf0 || status === 0xf7) {
+            let len = readVLQ();
+            offset += len;
+          } else {
+            if(type === 0x8 || type === 0x9 || type === 0xa || type === 0xb || type === 0xe) {
+              let p1 = read8();
+              let p2 = read8();
+              
+              // UPGRADED BINARY TRACKER: Capture Note On and Note Off events
+              if(type === 0x9 && p2 > 0) { 
+                // Traditional Note On
+                events.push({tick, note: p1, velocity: p2});
+              } else if(type === 0x8) {
+                // Explicit Note Off
+                events.push({tick, note: p1, velocity: 0});
+              } else if(type === 0x9 && p2 === 0) {
+                // Note On with 0 velocity shortcut (treated as Note Off)
+                events.push({tick, note: p1, velocity: 0});
+              }
+            } else if(type === 0xc || type === 0xd) {
+              let p1 = read8();
+              if(type === 0xc && instrument === 1) { 
+                instrument = p1 + 1;
+              }
+            }
+          }
+        }
+      }
+
+      self.postMessage({ type: "progress", value: 40 });
+
+      if (events.length === 0) {
+        throw new Error("No readable note data found inside this file.");
+      }
+
+      tempos.sort((a,b) => a.tick - b.tick);
+
+      const grouped = new Map();
+      const eventsLength = events.length;
+      for (let i = 0; i < eventsLength; i++) {
+        const ev = events[i];
+        let chord = grouped.get(ev.tick);
+        if (!chord) {
+          chord = [];
+          grouped.set(ev.tick, chord);
+        }
+        
+        // CHORD CONFLICT RESOLUTION: Ensure Note On overrides Note Off if they land on identical tick ticks
+        let existing = chord.find(n => n.note === ev.note);
+        if (!existing) {
+          chord.push({note: ev.note, velocity: ev.velocity});
+        } else {
+          if (ev.velocity > 0 && existing.velocity === 0) {
+            existing.velocity = ev.velocity;
+          }
+        }
+      }
+
+      const ticks = Array.from(grouped.keys()).sort((a,b) => a - b);
+      const ticksLength = ticks.length;
+      
+      self.postMessage({ type: "progress", value: 60 });
+
+      const out = [];
+      out.push("Instr: " + instrument);
+      
+      let tempoIndex = 0;
+      let currentBpm = tempos[0].bpm;
+      out.push("BPM: " + currentBpm);
+
+      let lastProgress = 60;
+
+      for (let i = 0; i < ticksLength; i++) {
+        const tick = ticks[i];
+
+        while (tempoIndex + 1 < tempos.length && tempos[tempoIndex+1].tick <= tick) {
+          tempoIndex++;
+          currentBpm = tempos[tempoIndex].bpm;
+          out.push("BPM: " + currentBpm);
+        }
+
+        const chord = grouped.get(tick).sort((a,b) => a.note - b.note);
+        const chordString = chord.map(n => n.note + "|" + n.velocity).join("~");
+        out.push("Note: " + chordString);
+
+        if (i < ticksLength - 1) {
+          const dt = ticks[i+1] - tick;
+          const rest = Math.abs(dt / ppq);
+          out.push("Rest: " + rest);
+        }
+
+        const pct = 60 + Math.floor((i / ticksLength) * 40);
+        if (pct !== lastProgress) {
+          self.postMessage({ type: "progress", value: pct });
+          lastProgress = pct;
+        }
+      }
+
+      const fullText = out.join("\\n");
+      const previewLines = out.slice(0, 500).join("\\n");
+      const fullBlob = new Blob([fullText], { type: "text/plain" });
+
+      self.postMessage({ type: "progress", value: 100 });
+      self.postMessage({ 
+        type: "done", 
+        preview: previewLines, 
+        isTruncated: out.length > 500,
+        blob: fullBlob 
+      });
+
+    } catch (err) {
+      self.postMessage({ type: "done", error: err.message });
+    }
+  };
+`;
+
+const blob = new Blob([workerCode], { type: "application/javascript" });
+const worker = new Worker(URL.createObjectURL(blob));
+
+worker.onmessage = (e) => {
+  if (e.data.type === "progress") {
+    updateProgress(e.data.value);
+  } else if (e.data.type === "done") {
+    if (e.data.error) {
+      updateProgress(100, true);
+      document.getElementById("output").value = "CRASH ERROR: " + e.data.error;
+      document.getElementById("downloadBtn").disabled = true;
+      return;
+    }
+    updateProgress(100);
+    let displayText = e.data.preview;
+    if (e.data.isTruncated) {
+      displayText += "\n\n[... Preview truncated for UI performance. Click 'Download Full Results' to get the full Scratch readable text! ...]";
+    }
+    document.getElementById("output").value = displayText;
+    downloadedBlob = e.data.blob;
+    document.getElementById("downloadBtn").disabled = false;
+  }
+};
+
+document.getElementById("convertBtn").onclick = async () => {
+  const file = document.getElementById("midiFile").files[0];
+  if (!file) return alert("Upload a MIDI file first!");
+  updateProgress(5);
+  document.getElementById("output").value = "Parsing raw binary natively...";
+  document.getElementById("downloadBtn").disabled = true;
+  downloadedBlob = null;
+  const arrayBuffer = await file.arrayBuffer();
+  worker.postMessage(arrayBuffer, [arrayBuffer]); 
+};
+
+document.getElementById("downloadBtn").onclick = () => {
+  if (!downloadedBlob) return;
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(downloadedBlob);
+  link.download = "scratch_midi_output.txt";
+  link.click();
+  URL.revokeObjectURL(link.href);
+};
+</script>
+
+</body>
+</html>
